@@ -8,6 +8,8 @@
       Start-ClaudeLocal / claude-local   Check LM Studio, sync the model list into the
                                          settings file, then launch claude --settings.
       Update-ClaudeLocalSettings         Sync LM Studio's models into the settings file only.
+      Set-ClaudeLocalServer              Point the settings file at another machine running LM Studio.
+      Set-ClaudeLocalApiKey              Save the API key LM Studio requires (Require Authentication).
       Test-LmChatTemplate                Check each model's chat template for the rules that
                                          break Claude Code (static scan, or -Live requests).
       Test-LmStudioServer                $true if the LM Studio server answers.
@@ -18,7 +20,10 @@
       . 'C:\Files\ClaudeLocal\ClaudeLocal.ps1'
 #>
 
-$script:LmDefaultBaseUrl  = 'http://localhost:1234'
+# CLAUDELOCAL_BASEURL / CLAUDELOCAL_TOKEN supply the server and API key only until a settings
+# file exists; the settings file takes over after that (see Get-LmSettingsConnection below).
+$script:LmDefaultBaseUrl  = if ($env:CLAUDELOCAL_BASEURL) { $env:CLAUDELOCAL_BASEURL.TrimEnd('/') } else { 'http://localhost:1234' }
+$script:LmAuthToken       = if ($env:CLAUDELOCAL_TOKEN) { $env:CLAUDELOCAL_TOKEN } else { 'lmstudio' }
 $script:LmDefaultSettings = Join-Path $env:USERPROFILE '.claude\lmstudio.settings.json'
 $script:LmHome            = Join-Path $env:USERPROFILE '.lmstudio'
 $script:LmLogPath         = Join-Path $env:USERPROFILE '.claude\logs\ClaudeLocal.log'
@@ -69,20 +74,108 @@ function Get-LmsExe {
     return $null
 }
 
-function Test-LmStudioServer {
+function Test-LmLocalUrl {
+    # The lms CLI and ~\.lmstudio files only describe this machine's LM Studio.
+    param([string]$BaseUrl = $script:LmDefaultBaseUrl)
+    try { ([uri]$BaseUrl).IsLoopback } catch { $false }
+}
+
+function Get-LmAuthHeader {
+    @{ Authorization = "Bearer $script:LmAuthToken" }
+}
+
+function Test-LmInteractive {
+    # Prompts only make sense with a console user (not piped input, e.g. scripted `claude -p`).
+    [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+}
+
+function Get-LmSettingsConnection {
+    # The server URL and API key stored in a settings file ($null for anything missing).
+    param([string]$SettingsPath)
+    $conn = [pscustomobject]@{ BaseUrl = $null; Token = $null }
+    if (Test-Path $SettingsPath) {
+        try {
+            $e = (Get-Content $SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).env
+            if ($e.ANTHROPIC_BASE_URL)   { $conn.BaseUrl = "$($e.ANTHROPIC_BASE_URL)".TrimEnd('/') }
+            if ($e.ANTHROPIC_AUTH_TOKEN) { $conn.Token   = "$($e.ANTHROPIC_AUTH_TOKEN)" }
+        } catch { }
+    }
+    $conn
+}
+
+# The settings file is what Claude Code actually uses, so it wins over the environment variables,
+# which only seed a new file.
+$script:LmInitialConnection = Get-LmSettingsConnection $script:LmDefaultSettings
+if ($script:LmInitialConnection.BaseUrl) { $script:LmDefaultBaseUrl = $script:LmInitialConnection.BaseUrl }
+if ($script:LmInitialConnection.Token)   { $script:LmAuthToken = $script:LmInitialConnection.Token }
+
+function ConvertTo-LmBaseUrl {
+    # "192.168.1.50", "host:1234" or "http://host:1234/" -> "http://host:1234" ($null if invalid).
+    # A bare host or IP gets LM Studio's default port, 1234.
+    param([string]$Address)
+    $a = "$Address".Trim().TrimEnd('/')
+    if ($a -notmatch '^(?<scheme>https?://)?(?<host>[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(:(?<port>\d{1,5}))?$') { return $null }
+    $scheme = if ($Matches.scheme) { $Matches.scheme } else { 'http://' }
+    $port   = if ($Matches.port) { ":$($Matches.port)" } elseif (-not $Matches.scheme) { ':1234' } else { '' }
+    "$scheme$($Matches.host)$port"
+}
+
+function Read-LmServerAddress {
+    # Returns a normalized base URL, $Default when the answer is blank, or $null to cancel.
+    param([string]$Default)
+    $hint = if ($Default) { "blank keeps $Default" } else { 'blank cancels' }
+    while ($true) {
+        $answer = Read-Host "LM Studio host or IP, e.g. 192.168.1.50 or 192.168.1.50:1234 ($hint)"
+        if (-not $answer.Trim()) { return $Default }
+        $url = ConvertTo-LmBaseUrl $answer
+        if ($url) { return $url }
+        Write-Warning "'$answer' is not a valid host name, IP address, or URL."
+    }
+}
+
+function Read-LmApiKey {
+    # Returns the typed API key, or $null if left blank.
+    $secure = Read-Host 'LM Studio API key (input hidden, blank cancels)' -AsSecureString
+    $plain  = [System.Net.NetworkCredential]::new('', $secure).Password
+    if ($plain) { $plain } else { $null }
+}
+
+function Get-LmStudioServerState {
+    <#
+    .SYNOPSIS
+        'Ready', 'Unauthorized' (the server answered but wants an API key), or 'Unreachable'.
+    #>
     param([string]$BaseUrl = $script:LmDefaultBaseUrl, [int]$TimeoutSec = 10)
     try {
-        $null = Invoke-RestMethod -Uri "$BaseUrl/v1/models" -TimeoutSec $TimeoutSec -ErrorAction Stop
-        return $true
+        $null = Invoke-RestMethod -Uri "$BaseUrl/v1/models" -Headers (Get-LmAuthHeader) -TimeoutSec $TimeoutSec -ErrorAction Stop
+        return 'Ready'
     } catch {
-        return $false
+        $code = $null
+        if ($_.Exception.Response) { try { $code = [int]$_.Exception.Response.StatusCode } catch { } }
+        if ($code -in 401, 403) { return 'Unauthorized' }
+        return 'Unreachable'
     }
+}
+
+function Test-LmStudioServer {
+    param([string]$BaseUrl = $script:LmDefaultBaseUrl, [int]$TimeoutSec = 10)
+    (Get-LmStudioServerState -BaseUrl $BaseUrl -TimeoutSec $TimeoutSec) -eq 'Ready'
 }
 
 function Start-LmStudioServer {
     param([string]$BaseUrl = $script:LmDefaultBaseUrl, [int]$WaitSec = 60)
 
-    if (Test-LmStudioServer -BaseUrl $BaseUrl) { return $true }
+    $state = Get-LmStudioServerState -BaseUrl $BaseUrl
+    if ($state -eq 'Ready') { return $true }
+    if ($state -eq 'Unauthorized') {
+        Write-Warning "LM Studio at $BaseUrl requires an API key. Run Set-ClaudeLocalApiKey."
+        return $false
+    }
+
+    if (-not (Test-LmLocalUrl $BaseUrl)) {
+        Write-Warning "LM Studio is not reachable at $BaseUrl. On that machine, start the server with 'Serve on Local Network' enabled and allow the port through its firewall."
+        return $false
+    }
 
     $lms = Get-LmsExe
     if (-not $lms) {
@@ -96,11 +189,82 @@ function Start-LmStudioServer {
 
     $deadline = (Get-Date).AddSeconds($WaitSec)
     while ((Get-Date) -lt $deadline) {
-        if (Test-LmStudioServer -BaseUrl $BaseUrl -TimeoutSec 5) { return $true }
+        # An auth-protected server answering 401 is up; the caller deals with the key.
+        if ((Get-LmStudioServerState -BaseUrl $BaseUrl -TimeoutSec 5) -ne 'Unreachable') { return $true }
         Start-Sleep -Seconds 2
     }
     Write-Warning "LM Studio server did not come up at $BaseUrl within $WaitSec seconds."
     return $false
+}
+
+function Resolve-ClaudeLocalServer {
+    <#
+    .SYNOPSIS
+        Find a usable LM Studio server and return its base URL ($null if none).
+    .DESCRIPTION
+        1. Use $BaseUrl if it answers.
+        2. If it is this machine and not running, try `lms server start`.
+        3. If LM Studio is missing here, `lms` fails, or the server is not reachable, ask for the
+           IP address / host name of a machine running LM Studio.
+        4. If the server wants an API key, ask for it (input hidden).
+        $script:LmAuthToken holds the key that worked. Nothing is saved to disk here.
+        Prompts are skipped (with a warning) when there is no interactive console.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$BaseUrl,
+        [switch]$PromptForServer,
+        [switch]$PromptForApiKey
+    )
+
+    $interactive = Test-LmInteractive
+    $origToken = $script:LmAuthToken
+
+    if (($PromptForServer -or $PromptForApiKey) -and -not $interactive) {
+        Write-Warning 'No interactive console; ignoring the request to prompt for the server address or API key.'
+        $PromptForServer = $PromptForApiKey = $false
+    }
+    if ($PromptForServer) { $BaseUrl = Read-LmServerAddress -Default $BaseUrl }
+    if ($PromptForApiKey) {
+        $key = Read-LmApiKey
+        if ($key) { $script:LmAuthToken = $key }
+    }
+
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $state = Get-LmStudioServerState -BaseUrl $BaseUrl
+        if ($state -eq 'Unreachable' -and (Test-LmLocalUrl $BaseUrl)) {
+            if (Start-LmStudioServer -BaseUrl $BaseUrl) { $state = Get-LmStudioServerState -BaseUrl $BaseUrl }
+        }
+
+        switch ($state) {
+            'Ready' { return $BaseUrl }
+            'Unauthorized' {
+                if (-not $interactive) {
+                    Write-Warning "LM Studio at $BaseUrl requires an API key. Run Set-ClaudeLocalApiKey."
+                    $script:LmAuthToken = $origToken
+                    return $null
+                }
+                Write-Host "LM Studio at $BaseUrl requires an API key (LM Studio > Developer > Server Settings > Require Authentication)." -ForegroundColor Yellow
+                $key = Read-LmApiKey
+                if (-not $key) { $script:LmAuthToken = $origToken; return $null }
+                $script:LmAuthToken = $key
+            }
+            default {
+                if (-not $interactive) {
+                    Write-Warning "LM Studio is not reachable at $BaseUrl."
+                    $script:LmAuthToken = $origToken
+                    return $null
+                }
+                Write-Host "LM Studio is not reachable at $BaseUrl. If it runs on another machine, enter that machine's address." -ForegroundColor Yellow
+                $next = Read-LmServerAddress
+                if (-not $next) { $script:LmAuthToken = $origToken; return $null }
+                $BaseUrl = $next
+            }
+        }
+    }
+
+    Write-Warning 'Giving up after repeated failures.'
+    $script:LmAuthToken = $origToken
+    return $null
 }
 
 function Get-LmStudioModel {
@@ -114,15 +278,16 @@ function Get-LmStudioModel {
     # /api/v0/models carries type, arch, quant and context; /v1/models is the fallback.
     $models = $null
     try {
-        $models = (Invoke-RestMethod -Uri "$BaseUrl/api/v0/models" -TimeoutSec 15 -ErrorAction Stop).data |
+        $models = (Invoke-RestMethod -Uri "$BaseUrl/api/v0/models" -Headers (Get-LmAuthHeader) -TimeoutSec 15 -ErrorAction Stop).data |
             Where-Object { $_.type -in 'llm', 'vlm' }
     } catch {
-        $models = (Invoke-RestMethod -Uri "$BaseUrl/v1/models" -TimeoutSec 15 -ErrorAction Stop).data |
+        $models = (Invoke-RestMethod -Uri "$BaseUrl/v1/models" -Headers (Get-LmAuthHeader) -TimeoutSec 15 -ErrorAction Stop).data |
             Where-Object { $_.id -notmatch 'embed' }
     }
 
     $lmsInfo = @{}
-    $lms = Get-LmsExe
+    # `lms ls` lists this machine's models, so it is only merged in for a local server.
+    $lms = if (Test-LmLocalUrl $BaseUrl) { Get-LmsExe }
     if ($lms) {
         try {
             $json = & $lms ls --json 2>$null | Out-String
@@ -170,12 +335,116 @@ function New-LmPickerOption {
     [ordered]@{ model = $Model.Id; label = $label; description = ($bits -join ', ') }
 }
 
+$script:LmModelSlots = 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL'
+
+function New-LmSettingsObject {
+    # A new settings file. With -Model, every model slot (including background and subagent
+    # work) points at that LM Studio model so nothing ever asks for an Anthropic model.
+    param([string]$BaseUrl, [string]$Token, [string]$Model)
+    $e = [ordered]@{
+        ANTHROPIC_BASE_URL                       = $BaseUrl
+        ANTHROPIC_AUTH_TOKEN                     = $Token
+        API_TIMEOUT_MS                           = '3000000'
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+        CLAUDE_CODE_ATTRIBUTION_HEADER           = '0'
+    }
+    if ($Model) { foreach ($k in $script:LmModelSlots) { $e[$k] = $Model } }
+    $s = [ordered]@{ env = [pscustomobject]$e }
+    if ($Model) { $s.model = $Model }
+    $s.modelPicker = [pscustomobject]@{ replaceBuiltInOptions = $true; options = @() }
+    [pscustomobject]$s
+}
+
+function Save-LmSettingsFile {
+    # Back up an existing file (timestamped, newest -BackupsToKeep kept), write the new one, log it.
+    # A failed backup aborts the write.
+    param(
+        [Parameter(Mandatory)] $Settings,
+        [Parameter(Mandatory)] [string]$SettingsPath,
+        [Parameter(Mandatory)] [string[]]$Changes,
+        [switch]$IsNew,
+        [int]$BackupsToKeep = 10
+    )
+
+    $backup = $null
+    $pruned = @()
+    try {
+        $dir = Split-Path $SettingsPath
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if (-not $IsNew) {
+            # Milliseconds keep two writes in the same second from overwriting each other's backup.
+            $backup = '{0}.{1:yyyyMMdd-HHmmss-fff}.bak' -f $SettingsPath, (Get-Date)
+            Copy-Item $SettingsPath $backup -ErrorAction Stop
+            $pruned = @(Get-ChildItem "$SettingsPath.*.bak" | Sort-Object Name -Descending |
+                Select-Object -Skip $BackupsToKeep)
+            $pruned | Remove-Item
+        }
+        $json = $Settings | ConvertTo-Json -Depth 20
+        [IO.File]::WriteAllText($SettingsPath, $json, [Text.UTF8Encoding]::new($false))
+    } catch {
+        Write-LmLog -Component 'Settings' -Severity 3 -Message "Failed to update ${SettingsPath}: $($_.Exception.Message). Pending changes not applied: $($Changes -join '; ')"
+        throw
+    }
+
+    Write-LmLog -Component 'Settings' -Message ("{0} {1} ({2} change(s))" -f $(if ($IsNew) { 'Created' } else { 'Updated' }), $SettingsPath, $Changes.Count)
+    if ($backup) { Write-LmLog -Component 'Settings' -Message "Backed up previous file to $backup" }
+    foreach ($p in $pruned) { Write-LmLog -Component 'Settings' -Message "Deleted old backup $($p.FullName) (keeping newest $BackupsToKeep)" }
+    foreach ($c in $Changes) { Write-LmLog -Component 'Settings' -Message $c }
+
+    Write-Host "Updated $SettingsPath" -ForegroundColor Cyan
+    if ($backup) { Write-Host "  backup: $backup" -ForegroundColor DarkGray }
+    Write-Host "  log:    $script:LmLogPath" -ForegroundColor DarkGray
+}
+
+function Update-LmSettingsEnv {
+    <#
+    .SYNOPSIS
+        Set values in the settings file's "env" block (creating a minimal file if needed).
+        Returns $true if the file was written; nothing is written when the values already match.
+        API key values are never logged.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [string]$SettingsPath,
+        [Parameter(Mandatory)] [System.Collections.IDictionary]$Values
+    )
+
+    $isNew = -not (Test-Path $SettingsPath)
+    if ($isNew) {
+        $settings = New-LmSettingsObject -BaseUrl $script:LmDefaultBaseUrl -Token $script:LmAuthToken
+    } else {
+        try {
+            $settings = Get-Content $SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "Could not read ${SettingsPath}; nothing changed. $($_.Exception.Message)"
+        }
+        if (-not $settings.PSObject.Properties['env']) {
+            $settings | Add-Member env ([pscustomobject]@{})
+        }
+    }
+
+    $changes = [System.Collections.Generic.List[string]]::new()
+    foreach ($k in $Values.Keys) {
+        $old = $settings.env.PSObject.Properties[$k]
+        if ($old -and "$($old.Value)" -eq "$($Values[$k])") { continue }
+        $settings.env | Add-Member -NotePropertyName $k -NotePropertyValue $Values[$k] -Force
+        $changes.Add($(if ($k -match 'TOKEN|KEY') { "Set env.$k (value not logged)" } else { "Set env.$k to '$($Values[$k])'" }))
+    }
+    if (-not $changes.Count) { return $false }
+
+    if ($PSCmdlet.ShouldProcess($SettingsPath, "Set $($Values.Keys -join ', ')")) {
+        Save-LmSettingsFile -Settings $settings -SettingsPath $SettingsPath -Changes $changes -IsNew:$isNew
+        return $true
+    }
+    return $false
+}
+
 function Update-ClaudeLocalSettings {
     <#
     .SYNOPSIS
         Add any LM Studio models missing from the settings file's /model picker.
     .DESCRIPTION
-        Before changing an existing file it is copied to <file>.<yyyyMMdd-HHmmss>.bak;
+        Before changing an existing file it is copied to <file>.<yyyyMMdd-HHmmss-fff>.bak;
         only the newest -BackupsToKeep backups are kept. Nothing is written if nothing changed.
     .PARAMETER Prune
         Also remove picker entries whose model no longer exists in LM Studio.
@@ -189,6 +458,10 @@ function Update-ClaudeLocalSettings {
         [switch]$Prune,
         [int]$BackupsToKeep = 10
     )
+
+    # The saved key (if any) is what Claude Code will send, so use it for the model query too.
+    $saved = Get-LmSettingsConnection $SettingsPath
+    if ($saved.Token) { $script:LmAuthToken = $saved.Token }
 
     $models = @(Get-LmStudioModel -BaseUrl $BaseUrl)
     if (-not $models) {
@@ -206,17 +479,12 @@ function Update-ClaudeLocalSettings {
         }
     } else {
         Write-Host "Creating $SettingsPath" -ForegroundColor Cyan
-        $settings = [pscustomobject]@{
-            env = [pscustomobject][ordered]@{
-                ANTHROPIC_BASE_URL                       = $BaseUrl
-                ANTHROPIC_AUTH_TOKEN                     = 'lmstudio'
-                API_TIMEOUT_MS                           = '3000000'
-                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
-                CLAUDE_CODE_ATTRIBUTION_HEADER           = '0'
-            }
-            model       = $ids[0]
-            modelPicker = [pscustomobject]@{ replaceBuiltInOptions = $true; options = @() }
-        }
+        $settings = New-LmSettingsObject -BaseUrl $BaseUrl -Token $script:LmAuthToken -Model $ids[0]
+    }
+
+    $fileUrl = "$($settings.env.ANTHROPIC_BASE_URL)".TrimEnd('/')
+    if ($fileUrl -and $fileUrl -ne $BaseUrl.TrimEnd('/')) {
+        Write-Warning "Models came from $BaseUrl but $SettingsPath sends Claude Code to $fileUrl. Run Set-ClaudeLocalServer to change it."
     }
 
     if (-not $settings.PSObject.Properties['modelPicker']) {
@@ -227,6 +495,12 @@ function Update-ClaudeLocalSettings {
 
     $isNew   = -not (Test-Path $SettingsPath)
     $changes = [System.Collections.Generic.List[string]]::new()   # logged only once the file is written
+
+    # A file created before any model was known (e.g. by Set-ClaudeLocalApiKey) has no default yet.
+    if (-not $settings.PSObject.Properties['model'] -or -not $settings.model) {
+        $settings | Add-Member -NotePropertyName model -NotePropertyValue $ids[0] -Force
+        $changes.Add("Set default model to '$($ids[0])'")
+    }
 
     foreach ($m in $models) {
         if ($options.model -notcontains $m.Id) {
@@ -264,39 +538,92 @@ function Update-ClaudeLocalSettings {
     if ($changes.Count) {
         $settings.modelPicker.options = $options.ToArray()
         if ($PSCmdlet.ShouldProcess($SettingsPath, 'Write updated model list')) {
-            $backup = $null
-            $pruned = @()
-            try {
-                if (-not $isNew) {
-                    # Timestamped so repeated updates never overwrite an earlier backup;
-                    # a failed backup aborts the write.
-                    $backup = '{0}.{1:yyyyMMdd-HHmmss}.bak' -f $SettingsPath, (Get-Date)
-                    Copy-Item $SettingsPath $backup -ErrorAction Stop
-                    $pruned = @(Get-ChildItem "$SettingsPath.*.bak" | Sort-Object Name -Descending |
-                        Select-Object -Skip $BackupsToKeep)
-                    $pruned | Remove-Item
-                }
-                $json = $settings | ConvertTo-Json -Depth 20
-                [IO.File]::WriteAllText($SettingsPath, $json, [Text.UTF8Encoding]::new($false))
-            } catch {
-                Write-LmLog -Component 'Settings' -Severity 3 -Message "Failed to update ${SettingsPath}: $($_.Exception.Message). Pending changes not applied: $($changes -join '; ')"
-                throw
-            }
-
-            Write-LmLog -Component 'Settings' -Message ("{0} {1} ({2} change(s))" -f $(if ($isNew) { 'Created' } else { 'Updated' }), $SettingsPath, $changes.Count)
-            if ($backup) { Write-LmLog -Component 'Settings' -Message "Backed up previous file to $backup" }
-            foreach ($p in $pruned) { Write-LmLog -Component 'Settings' -Message "Deleted old backup $($p.FullName) (keeping newest $BackupsToKeep)" }
-            foreach ($c in $changes) { Write-LmLog -Component 'Settings' -Message $c }
-
-            Write-Host "Updated $SettingsPath" -ForegroundColor Cyan
-            if ($backup) { Write-Host "  backup: $backup" -ForegroundColor DarkGray }
-            Write-Host "  log:    $script:LmLogPath" -ForegroundColor DarkGray
+            Save-LmSettingsFile -Settings $settings -SettingsPath $SettingsPath -Changes $changes -IsNew:$isNew -BackupsToKeep $BackupsToKeep
         }
     } else {
         Write-Host 'Model list already up to date.' -ForegroundColor DarkGray
     }
 
     $models
+}
+
+function Set-ClaudeLocalServer {
+    <#
+    .SYNOPSIS
+        Point the settings file at a different LM Studio machine (prompts for the address).
+    .DESCRIPTION
+        Accepts an IP address, host name, host:port, or URL; a bare host gets LM Studio's
+        default port 1234. Only ANTHROPIC_BASE_URL changes. Use -Address localhost to switch back.
+    .EXAMPLE
+        Set-ClaudeLocalServer 192.168.1.50
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$Address,
+        [string]$SettingsPath = $script:LmDefaultSettings
+    )
+
+    if (-not $Address) { $Address = Read-LmServerAddress }
+    if (-not $Address) { Write-Host 'No address entered; nothing changed.' -ForegroundColor DarkGray; return }
+    $url = ConvertTo-LmBaseUrl $Address
+    if (-not $url) { throw "'$Address' is not a valid host name, IP address, or URL." }
+
+    $saved = Get-LmSettingsConnection $SettingsPath
+    if ($saved.Token) { $script:LmAuthToken = $saved.Token }
+    switch (Get-LmStudioServerState -BaseUrl $url) {
+        'Ready'        { Write-Host "LM Studio answered at $url." -ForegroundColor Green }
+        'Unauthorized' { Write-Warning "LM Studio at $url requires an API key that differs from the saved one. Run Set-ClaudeLocalApiKey." }
+        default        { Write-Warning "Nothing answered at $url yet. Saving it anyway; check that the server is running with 'Serve on Local Network' and the firewall allows the port." }
+    }
+
+    if (Update-LmSettingsEnv -SettingsPath $SettingsPath -Values ([ordered]@{ ANTHROPIC_BASE_URL = $url }) -WhatIf:$WhatIfPreference) {
+        $script:LmDefaultBaseUrl = $url
+    } else {
+        Write-Host "Server already set to $url." -ForegroundColor DarkGray
+    }
+}
+
+function Set-ClaudeLocalApiKey {
+    <#
+    .SYNOPSIS
+        Save the API key LM Studio requires (Developer > Server Settings > Require Authentication).
+    .DESCRIPTION
+        Prompts with hidden input unless -ApiKey is given. The key is written to the settings file
+        as ANTHROPIC_AUTH_TOKEN in plain text, so keep that file private. -Clear resets it to the
+        placeholder 'lmstudio' for servers without authentication. The key is never logged.
+    .EXAMPLE
+        Set-ClaudeLocalApiKey
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [securestring]$ApiKey,
+        [switch]$Clear,
+        [string]$SettingsPath = $script:LmDefaultSettings
+    )
+
+    if ($Clear) {
+        $plain = 'lmstudio'
+    } else {
+        if (-not $ApiKey) { $ApiKey = Read-Host 'LM Studio API key (input hidden)' -AsSecureString }
+        $plain = [System.Net.NetworkCredential]::new('', $ApiKey).Password
+        if (-not $plain) { Write-Host 'No key entered; nothing changed.' -ForegroundColor DarkGray; return }
+    }
+
+    $saved = Get-LmSettingsConnection $SettingsPath
+    $url = if ($saved.BaseUrl) { $saved.BaseUrl } else { $script:LmDefaultBaseUrl }
+
+    $previous = $script:LmAuthToken
+    $script:LmAuthToken = $plain
+    switch (Get-LmStudioServerState -BaseUrl $url) {
+        'Ready'        { Write-Host "LM Studio at $url accepted the key." -ForegroundColor Green }
+        'Unauthorized' { Write-Warning "LM Studio at $url rejected this key. Saving it anyway." }
+        default        { Write-Warning "LM Studio is not reachable at $url, so the key could not be checked. Saving it anyway." }
+    }
+
+    if (-not (Update-LmSettingsEnv -SettingsPath $SettingsPath -Values ([ordered]@{ ANTHROPIC_AUTH_TOKEN = $plain }) -WhatIf:$WhatIfPreference)) {
+        $script:LmAuthToken = $previous
+        Write-Host 'API key unchanged.' -ForegroundColor DarkGray
+    }
 }
 
 function Get-LmChatTemplate {
@@ -335,7 +662,7 @@ function Invoke-LmTemplateProbe {
     param([string]$Uri, [hashtable]$Body, [int]$TimeoutSec)
     try {
         $null = Invoke-RestMethod -Uri $Uri -Method Post -ContentType 'application/json' `
-            -Headers @{ 'x-api-key' = 'lmstudio'; 'anthropic-version' = '2023-06-01' } `
+            -Headers @{ 'x-api-key' = $script:LmAuthToken; 'anthropic-version' = '2023-06-01'; Authorization = "Bearer $script:LmAuthToken" } `
             -Body ($Body | ConvertTo-Json -Depth 20) -TimeoutSec $TimeoutSec -ErrorAction Stop
         return $null
     } catch {
@@ -372,6 +699,9 @@ function Test-LmChatTemplate {
         [int]$TimeoutSec = 600
     )
 
+    if (-not (Test-LmLocalUrl $BaseUrl)) {
+        throw "Test-LmChatTemplate reads LM Studio's local files and CLI, so it only works against a local server. Run it on the LM Studio machine."
+    }
     $lms = Get-LmsExe
     if (-not $lms) { throw "The 'lms' CLI is required to map models to their templates." }
     $all = (& $lms ls --json 2>$null | Out-String | ConvertFrom-Json) | Where-Object type -eq 'llm'
@@ -477,26 +807,56 @@ function Start-ClaudeLocal {
           -LmSkipUpdate          Don't query LM Studio for new models.
           -LmCheckTemplates      Run the static chat-template check before launching.
           -LmSettingsPath <path> Settings file (default ~\.claude\lmstudio.settings.json).
-          -LmBaseUrl <url>       LM Studio server (default http://localhost:1234).
+          -LmBaseUrl <url>       LM Studio server to use (saved to the settings file). Default: the URL
+                                 in the settings file, else $env:CLAUDELOCAL_BASEURL, else localhost:1234.
+          -LmSetServer           Prompt for the IP address / host of the LM Studio machine.
+          -LmSetApiKey           Prompt for LM Studio's API key (hidden) and save it.
+
+        If LM Studio is not installed here, `lms server start` fails, or the server is not
+        reachable, you are asked for the address of a machine that runs it, and the settings
+        file is updated to that address. If the server requires an API key you are asked for it.
+        Claude Code is only ever launched against LM Studio; run plain `claude` for Anthropic.
     #>
     # No param() block: declared parameters would bind claude's arguments by position
     # (and [CmdletBinding()] adds common parameters that swallow flags like -p),
     # so the -Lm* switches are picked out of $args by hand.
     $LmModel = $null; $LmSkipUpdate = $false; $LmCheckTemplates = $false
-    $LmSettingsPath = $script:LmDefaultSettings; $LmBaseUrl = $script:LmDefaultBaseUrl
+    $LmSetServer = $false; $LmSetApiKey = $false
+    $LmSettingsPath = $script:LmDefaultSettings; $LmBaseUrl = $null
     $passThru = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $args.Count; $i++) {
         switch -Regex ("$($args[$i])") {
             '^-LmModel$'          { $LmModel = $args[++$i]; continue }
             '^-LmSkipUpdate$'     { $LmSkipUpdate = $true; continue }
             '^-LmCheckTemplates$' { $LmCheckTemplates = $true; continue }
+            '^-LmSetServer$'      { $LmSetServer = $true; continue }
+            '^-LmSetApiKey$'      { $LmSetApiKey = $true; continue }
             '^-LmSettingsPath$'   { $LmSettingsPath = $args[++$i]; continue }
             '^-LmBaseUrl$'        { $LmBaseUrl = $args[++$i]; continue }
             default               { $passThru.Add($args[$i]) }
         }
     }
 
-    if (-not (Start-LmStudioServer -BaseUrl $LmBaseUrl)) { return }
+    # The settings file is what Claude Code will use, so its server and key are the starting point.
+    $saved = Get-LmSettingsConnection $LmSettingsPath
+    if ($saved.Token) { $script:LmAuthToken = $saved.Token }
+    if ($LmBaseUrl) {
+        $LmBaseUrl = ConvertTo-LmBaseUrl $LmBaseUrl
+        if (-not $LmBaseUrl) { Write-Warning '-LmBaseUrl is not a valid host name, IP address, or URL.'; return }
+    } else {
+        $LmBaseUrl = if ($saved.BaseUrl) { $saved.BaseUrl } else { $script:LmDefaultBaseUrl }
+    }
+
+    $LmBaseUrl = Resolve-ClaudeLocalServer -BaseUrl $LmBaseUrl -PromptForServer:$LmSetServer -PromptForApiKey:$LmSetApiKey
+    if (-not $LmBaseUrl) { return }
+
+    # Save whatever address/key actually worked, so Claude Code connects the same way.
+    if (Test-Path $LmSettingsPath) {
+        $null = Update-LmSettingsEnv -SettingsPath $LmSettingsPath -Values ([ordered]@{
+            ANTHROPIC_BASE_URL   = $LmBaseUrl
+            ANTHROPIC_AUTH_TOKEN = $script:LmAuthToken
+        })
+    }
 
     $models = $null
     if (-not $LmSkipUpdate) {
@@ -507,8 +867,10 @@ function Start-ClaudeLocal {
         return
     }
 
-    if ($LmCheckTemplates) {
-        $bad = Test-LmChatTemplate | Where-Object Status -ne 'OK'
+    if ($LmCheckTemplates -and -not (Test-LmLocalUrl $LmBaseUrl)) {
+        Write-Warning '-LmCheckTemplates only works against a local LM Studio; skipped.'
+    } elseif ($LmCheckTemplates) {
+        $bad = Test-LmChatTemplate -BaseUrl $LmBaseUrl | Where-Object Status -ne 'OK'
         if ($bad) { Write-Warning "Chat template issues: $($bad.Model -join ', '). See 'Fixing chat template errors' in ClaudeLocalSetup.md." }
     }
 

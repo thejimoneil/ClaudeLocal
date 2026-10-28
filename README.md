@@ -1,6 +1,10 @@
 # ClaudeLocal
 
-Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) with models served by [LM Studio](https://lmstudio.ai/), on this machine or another one on your network. `claude-local` always launches Claude Code against LM Studio: it syncs LM Studio's models into a separate Claude Code settings file and points every model slot (default, background, and subagent) at LM Studio models. It never falls back to Anthropic; for that, run plain `claude`.
+Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) with models served by [LM Studio](https://lmstudio.ai/), on this machine or another one on your network. 
+
+Is this a good idea? No. Does it work? Yes. Is it supported? Probably Not. Try it anyway. 
+
+`claude-local` always launches Claude Code against LM Studio: it syncs LM Studio's models into a separate Claude Code settings file and points every model slot (default, background, and subagent) at LM Studio models. It never falls back to Anthropic; for that, run plain `claude`.
 
 For detailed configuration examples, chat-template guidance, and troubleshooting, see [ClaudeLocalSetup.md](ClaudeLocalSetup.md).
 
